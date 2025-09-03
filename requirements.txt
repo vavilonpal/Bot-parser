@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+python-telegram-bot==20.6
+schedule
+selenium
+webdriver-manager
