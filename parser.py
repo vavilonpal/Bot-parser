@@ -11,256 +11,362 @@ from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 from telegram import Bot
 from selenium.common.exceptions import TimeoutException
+import re
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s: %(message)s'
 )
 
-TELEGRAM_TOKEN = '7169698899:AAELmsw_gIOF-YBLXCeG0SjpGCnjol4txsI'
-PRIMARY_CHAT_ID = '962929346'
-SECONDARY_CHAT_ID = '1017188788'
-bot = Bot(token=TELEGRAM_TOKEN)
+# ============================================================
+#   TELEGRAM
+# ============================================================
+TELEGRAM_TOKEN = '8664437815:AAF5TjvMm7IxIvUpLCcS9XpUDwlM_wOw7Bs'
+PRIMARY_CHAT_ID = '1834103343'
+SECONDARY_CHAT_ID = '1858170014'
 
+# ============================================================
+#   ФИЛЬТРЫ ЦЕН  (бот отправит только если цена в диапазоне)
+# ============================================================
+PRICE_EUR_MIN = 150  # €  минимум
+PRICE_EUR_MAX = 300  # €  максимум
+PRICE_USD_MIN = 200  # $  минимум
+PRICE_USD_MAX = 350  # $  максимум
+PRICE_MDL_MIN = 3000  # лей минимум
+PRICE_MDL_MAX = 6000  # лей максимум
+
+# ============================================================
+#   ФИЛЬТРЫ 999.MD
+#   Районы Кишинёва:
+#     Центр=894, Ботаника=902, Рышкановка=900, Чеканы=12900,
+#     Буюканы=12885, Телецентр=13859, Скулянка=12912
+# ============================================================
+PRICE_999_MIN = 150  # € от
+PRICE_999_MAX = 300  # € до
+DISTRICTS_999 = "894,902"  # районы через запятую
+
+URL_999 = (
+    "https://999.md/ru/list/real-estate/apartments-and-rooms"
+    "?appl=1&applied=1"
+    "&ef=2203,32,30,6,9441"
+    "&eo=12912,12885,12900,13859"
+    "&o_33_1=912"
+    "&o_2203_795=18895"
+    "&o_32_9_12900_13859=15667"
+    "&sort=yes&sort_type=date_desc"
+    f"&from_6_2={PRICE_999_MIN}&to_6_2={PRICE_999_MAX}&unit_6_2=eur"
+    "&from_9441_2=200&to_9441_2=400&unit_9441_2=eur"
+    f"&o_30_241={DISTRICTS_999}"
+)
+
+# ============================================================
+#   ФИЛЬТРЫ MAKLER.MD
+#   Комнаты: 2802=1 комната, 2803=2 комнаты, 2804=3 комнаты
+#   Валюта:  5=USD, 2=EUR, 3=MDL
+#   Районы Кишинёва:
+#     Центр=1024, Ботаника=1025, Рышкановка=1026,
+#     Буюканы=1030, Чеканы=1023
+# ============================================================
+PRICE_MAKLER_MIN = 200  # от
+PRICE_MAKLER_MAX = 400  # до
+CURRENCY_MAKLER = 5  # 5=USD
+ROOMS_MAKLER = 2802  # 1 комната
+DISTRICTS_MAKLER = [1024, 1025, 1026, 1030, 1023]
+
+_dist = "".join(f"&district[]={d}" for d in DISTRICTS_MAKLER)
+URL_MAKLER = (
+    "https://makler.md/ru/real-estate/real-estate-for-rent/apartments-for-rent"
+    f"?list&city[]=28{_dist}"
+    f"&field_432[]={ROOMS_MAKLER}"
+    "&field_372[]=2666&field_372[]=2667"
+    f"&price_min={PRICE_MAKLER_MIN}&price_max={PRICE_MAKLER_MAX}"
+    f"&currency_id={CURRENCY_MAKLER}"
+    "&order=date&direction=desc"
+)
+
+# ============================================================
+#   ПРОЧИЕ НАСТРОЙКИ
+# ============================================================
 SEEN_IDS_FILE = "seen_ids.txt"
 SEEN_IDS_FILE_MAKLER = "seen_ids_makler.txt"
+SCROLL_PAUSE_TIME = 1.5
+MAX_SCROLLS = 4
+PAGE_LOAD_TIMEOUT = 20  # секунд ждать загрузки страницы
+LOOP_INTERVAL = 60  # секунд между итерациями
 
-SCROLL_PAUSE_TIME = 1.0
-MAX_SCROLLS = 3
+# ============================================================
 
+bot = Bot(token=TELEGRAM_TOKEN)
+
+
+def make_driver():
+    chrome_path = ChromeDriverManager().install()
+    service = Service(chrome_path)
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/148.0.0.0 Safari/537.36"
+    )
+    return webdriver.Chrome(service=service, options=options)
+
+
+def scroll_page(driver):
+    for _ in range(MAX_SCROLLS):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(SCROLL_PAUSE_TIME)
+
+
+# --- Цена ---
 
 def extract_price(price_str):
     digits = ''.join(c for c in price_str if c.isdigit())
-    price = int(digits) if digits else 0
-    logging.debug(f"extract_price: '{price_str}' -> {price}")
-    return price
+    return int(digits) if digits else 0
 
 
 def is_price_acceptable(price_str):
     price = extract_price(price_str)
     low = price_str.lower()
-    if '€' in low:
-        result = 150 <= price <= 300
-    elif '$' in low:
-        result = 200 <= price <= 350
-    elif any(cur in low for cur in ('mdl', 'лей', 'lei')):
-        result = 3000 <= price <= 6000
+    if '€' in low or 'eur' in low:
+        result = PRICE_EUR_MIN <= price <= PRICE_EUR_MAX
+    elif '$' in low or 'usd' in low:
+        result = PRICE_USD_MIN <= price <= PRICE_USD_MAX
+    elif any(c in low for c in ('mdl', 'лей', 'lei')):
+        result = PRICE_MDL_MIN <= price <= PRICE_MDL_MAX
     else:
         result = False
-    logging.info(f"is_price_acceptable: '{price_str}' -> {price}, acceptable={result}")
+    logging.info(f"Цена '{price_str}' -> {price}, подходит={result}")
     return result
 
 
+# --- Telegram ---
+
 async def send_ads_to_telegram(ad):
-    logging.info(f"send_ads_to_telegram: проверка объявления {ad['id']}")
-    if is_price_acceptable(ad['price']):
-        message = f"🏠 {ad['title']}\n💰 {ad['price']}\n🔗 {ad['link']}"
-        try:
-            await bot.send_message(chat_id=PRIMARY_CHAT_ID, text=message)
-            await bot.send_message(chat_id=SECONDARY_CHAT_ID, text=message)
-            logging.info(f"Сообщение отправлено: {ad['id']} всем чатам")
-            return True
-        except Exception as e:
-            logging.error(f"Ошибка при отправке в Telegram: {e}")
-    else:
-        logging.info(f"Объявление пропущено (цена не подходит): {ad['price']}")
+    if not is_price_acceptable(ad['price']):
+        logging.info(f"Пропущено (цена): {ad['price']}")
+        return False
+    message = f"🏠 {ad['title']}\n💰 {ad['price']}\n🔗 {ad['link']}"
+    try:
+        await bot.send_message(chat_id=PRIMARY_CHAT_ID, text=message)
+        ## await bot.send_message(chat_id=SECONDARY_CHAT_ID, text=message)
+        logging.info(f"Отправлено: {ad['id']}")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка Telegram: {e}")
     return False
 
 
-def load_seen_ids():
+# --- Seen IDs ---
+
+def load_seen_ids(path):
     try:
-        with open(SEEN_IDS_FILE, "r") as f:
-            ids = set(line.strip() for line in f)
-        logging.info(f"Loaded {len(ids)} seen IDs")
+        with open(path, "r") as f:
+            ids = set(line.strip() for line in f if line.strip())
+        logging.info(f"Загружено {len(ids)} ID из {path}")
         return ids
     except FileNotFoundError:
-        logging.info("No seen IDs file found, starting fresh")
         return set()
 
 
-def save_seen_id(ad_id):
-    with open(SEEN_IDS_FILE, "a") as f:
+def save_seen_id(path, ad_id):
+    with open(path, "a") as f:
         f.write(f"{ad_id}\n")
-    logging.debug(f"Saved ad ID: {ad_id}")
-
-def load_seen_ids_makler():
-    try:
-        with open(SEEN_IDS_FILE_MAKLER, "r") as f:
-            return set(line.strip() for line in f)
-    except FileNotFoundError:
-        return set()
-
-def save_seen_id_makler(ad_id):
-    with open(SEEN_IDS_FILE_MAKLER, "a") as f:
-        f.write(ad_id + "\n")
-
-def parse_ads():
-    chrome_path = ChromeDriverManager(driver_version="136.0.7103.92").install()
-    service = Service(chrome_path)
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(service=service, options=options)
-
-    url = (
-        'https://999.md/ru/list/real-estate/apartments-and-rooms?appl=1&applied=1&ef=2203,32,30,6,9441&eo=12912,12885,12900,13859&o_33_1=912&o_2203_795=18895&o_32_9_12900_13859=15667&sort=yes&sort_type=date_desc&to_6_2=320&unit_6_2=eur&from_6_2=150&from_9441_2=200&unit_9441_2=eur&to_9441_2=400&o_30_241=894,902'
-    )
-
-    logging.info(f"Parsing ads from: {url}")
-    driver.get(url)
-
-    wait = WebDriverWait(driver, 10)
-    try:
-        wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'div.AdPhoto_wrapper__gAOIH')))
-    except Exception as e:
-        logging.error(f"Timeout waiting for ads to load: {e}")
-
-    for _ in range(MAX_SCROLLS):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(SCROLL_PAUSE_TIME)
-
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    ads = []
-    items = soup.select('div.AdPhoto_wrapper__gAOIH')
-    logging.info(f"Found {len(items)} ad items on page")
-    for node in items:
-        try:
-            title_el = node.select_one('a.AdPhoto_info__link__OwhY6')
-            price_el = node.select_one('span.AdPrice_price__2L3eA')
-            img_el = node.select_one('img')
-            if not (title_el and price_el and img_el):
-                continue
-            href = title_el.get('href', '')
-            path = href.split('?')[0]
-            ad_id = path.strip('/').split('/')[-1]
-            link = href if href.startswith('http') else f"https://999.md{href}"
-            price_text = price_el.get_text(strip=True)
-            img_src = img_el.get('src') or img_el.get('data-src')
-            ads.append({
-                'id': ad_id,
-                'title': title_el.get_text(strip=True),
-                'price': price_text,
-                'link': link,
-                'image': img_src
-            })
-        except Exception as e:
-            logging.warning(f"Failed parsing ad node: {e}")
-    logging.info(f"Total ads parsed: {len(ads)}")
-    driver.quit()
-    return ads
 
 
+# --- Парсер 999.md ---
 
+def parse_ads_999():
+    logging.info("999.md: открываю страницу")
 
-def parse_makler_ads():
-    chrome_path = ChromeDriverManager(driver_version="136.0.7103.92").install()
-    service = Service(chrome_path)
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(service=service, options=options)
-
-    safe_url = (
-        "https://makler.md/ru/real-estate/real-estate-for-rent/apartments-for-rent?list&city[]=28&district[]=1024&district[]=1025&district[]=1026&district[]=1030&district[]=1023&field_432[]=2802&field_372[]=2666&field_372[]=2667&price_min=200&price_max=400&currency_id=5&order=date&direction=desc&list=false"
-    )
-
-    logging.info(f"Parsing Makler ads from: {safe_url}")
-    driver.get(safe_url)
+    driver = make_driver()
 
     try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "noscript"))
+        driver.get(URL_999)
+
+        wait = WebDriverWait(driver, 10)
+
+        wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR,
+                 'a.styles_advert__photo__link__SnL_t')
+            )
         )
-        noscripts = driver.find_elements(By.TAG_NAME, "noscript")
 
-        raw_html = "".join(ns.get_attribute("innerHTML") for ns in noscripts)
-        soup = BeautifulSoup(raw_html, "html.parser")
-    except TimeoutException:
-        logging.warning("Timeout waiting for <noscript>, парсим page_source")
-        soup = BeautifulSoup(driver.page_source, "html.parser")
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+
+        ads = []
+
+        items = soup.select(
+            'a.styles_advert__photo__link__SnL_t'
+        )
+
+        logging.info(f"999.md: {len(items)} карточек")
+
+        for node in items:
+            try:
+                href = node.get('href', '')
+
+                ad_id = (
+                    href.strip('/')
+                    .split('/')[-1]
+                    .split('?')[0]
+                )
+
+                link = (
+                    href
+                    if href.startswith('http')
+                    else f"https://999.md{href}"
+                )
+
+                # Заголовок
+                title_node = node.select_one('h4')
+
+                title = (
+                    title_node.get_text(strip=True)
+                    if title_node else ''
+                )
+
+                # Цена
+                price_node = node.select_one(
+                    'span.styles_price__text__VPLPL'
+                )
+
+                price = (
+                    price_node.get_text(strip=True)
+                    if price_node else '0'
+                )
+
+                ads.append({
+                    'id': ad_id,
+                    'title': title,
+                    'price': price,
+                    'link': link
+                })
+
+            except Exception as e:
+                logging.warning(f"999.md parse error: {e}")
+
+        return ads
+
     finally:
         driver.quit()
 
-    container = soup.find("div", class_="ls-detail")
-    if not container:
-        logging.warning("Не нашёл контейнер .ls-detail на странице")
-        return []
 
-    articles = container.find_all("article")
-    logging.info(f"Makler: найдено {len(articles)} объявлений")
+# --- Парсер makler.md ---
+
+def parse_makler_ads():
+    logging.info(f"makler.md: открываю страницу")
+    driver = make_driver()
+    try:
+        driver.get(URL_MAKLER)
+        wait = WebDriverWait(driver, PAGE_LOAD_TIMEOUT)
+
+        for sel in [
+            'article.ls-detail_item',
+            'article[class*="ls-detail"]',
+            'div.ls-detail article',
+            'div[class*="listing"] article',
+            'article',
+        ]:
+            try:
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+                logging.info(f"makler.md: карточки найдены по '{sel}'")
+                break
+            except TimeoutException:
+                continue
+
+        scroll_page(driver)
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+    finally:
+        driver.quit()
+
+    # Ищем контейнер с карточками
+    container = soup.find('div', class_='ls-detail')
+    articles = container.find_all('article') if container else []
+    if not articles:
+        articles = soup.select('article[class*="ls-detail"]')
+    if not articles:
+        articles = soup.find_all('article')
+
+    logging.info(f"makler.md: найдено {len(articles)} карточек")
     ads = []
+
     for art in articles:
         try:
-            img_el = art.select_one(".ls-detail_imgBlock img")
-            img_src = img_el["src"] if img_el else None
+            title_el = (
+                    art.select_one('h3 a') or
+                    art.select_one('h2 a') or
+                    art.select_one('a[class*="title"]') or
+                    art.select_one('a[href*="/ru/real-estate/"]')
+            )
+            if not title_el: continue
 
-            time_el = art.select_one(".ls-detail_controlsBlock .ls-detail_time")
-            time_str = time_el.get_text(strip=True) if time_el else ""
+            href = title_el.get('href', '')
+            ad_id = href.strip('/').split('/')[-1]
+            link = href if href.startswith('http') else f"https://makler.md{href}"
 
-            title_el = art.select_one(".ls-detail_infoBlock h3.ls-detail_antTitle a")
-            title = title_el.get_text(strip=True)
-            href  = title_el["href"]
-            ad_id = href.strip("/").split("/")[-1]
-            link  = href if href.startswith("http") else f"https://makler.md{href}"
+            price_el = (
+                    art.select_one('[class*="price"]') or
+                    art.select_one('[class*="Price"]')
+            )
+            price = price_el.get_text(strip=True) if price_el else '0'
 
-            desc_p = art.select_one(".ls-detail_infoBlock p")
-            description = " ".join(desc_p.stripped_strings) if desc_p else ""
-
-            data_block = art.select_one(".ls-detail_infoBlock .ls-detail_anData")
-            price_el = data_block.select_one(".ls-detail_price") if data_block else None
-            price = price_el.get_text(strip=True) if price_el else ""
-            spans = data_block.find_all("span") if data_block else []
-            phone = spans[1].get_text(strip=True) if len(spans) > 1 else ""
-
-            ads.append({
-                "id":          ad_id,
-                "title":       title,
-                "time":        time_str,
-                "description": description,
-                "price":       price,
-                "phone":       phone,
-                "link":        link,
-                "image":       img_src,
-            })
+            ads.append({'id': ad_id, 'title': title_el.get_text(strip=True),
+                        'price': price, 'link': link})
         except Exception as e:
-            logging.warning(f"Ошибка парсинга одного объявления: {e}")
+            logging.warning(f"makler.md: {e}")
+
+    logging.info(f"makler.md: итого {len(ads)} объявлений")
     return ads
 
-async def main():
-    logging.info("=== Новая итерация для 999.md ===")
-    seen_999 = load_seen_ids()
-    ads_999  = parse_ads()
-    for ad in ads_999:
-        if ad['id'] not in seen_999:
-            logging.info(f"999.md: новое объявление {ad['id']}")
-            if await send_ads_to_telegram(ad):
-                save_seen_id(ad['id'])
-        else:
-            logging.debug(f"999.md: уже было {ad['id']}")
 
-    logging.info("=== Новая итерация для makler.md ===")
-    seen_makler = load_seen_ids_makler()
-    ads_makler  = parse_makler_ads()
-    for ad in ads_makler:
-        if ad['id'] not in seen_makler:
-            logging.info(f"makler.md: новое объявление {ad['id']}")
+# --- Основной цикл ---
+
+async def main():
+    logging.info("=== Итерация 999.md ===")
+    seen_999 = load_seen_ids(SEEN_IDS_FILE)
+
+    for ad in parse_ads_999():
+        link = ad.get("link", "")
+        match = re.search(r"\d+", link)
+
+        # 1. Проверяем, удалось ли вообще найти ID в ссылке
+        if not match:
+            logging.warning(f"Не удалось найти ID в ссылке: {link}")
+            continue
+
+        ad_id = ad.get("id", "")
+
+        # 2. Проверяем, видели ли мы ИМЕННО ЭТОТ ad_id
+        if ad_id not in seen_999:
             if await send_ads_to_telegram(ad):
-                save_seen_id_makler(ad['id'])
-        else:
-            logging.debug(f"makler.md: уже было {ad['id']}")
+                # 3. Сохраняем ИМЕННО ad_id, а не ad['id']
+                save_seen_id(SEEN_IDS_FILE, ad_id)
+                seen_999.add(ad_id)
+                logging.info(f"Объявление {ad_id} успешно отправлено и сохранено.")
+
+    logging.info("=== Итерация makler.md ===")
+    seen_makler = load_seen_ids(SEEN_IDS_FILE_MAKLER)
+    for ad in parse_makler_ads():
+        if ad['id'] not in seen_makler:
+            if await send_ads_to_telegram(ad):
+                save_seen_id(SEEN_IDS_FILE_MAKLER, ad['id'])
+                seen_makler.add(ad['id'])
+
 
 async def main_loop():
     while True:
         try:
             await main()
         except Exception as e:
-            logging.error(f"Error in main_loop: {e}")
-        logging.info("Sleeping for 60 seconds before next iteration")
-        await asyncio.sleep(5)
+            logging.error(f"Ошибка в main_loop: {e}", exc_info=True)
+        logging.info(f"Sleeping {LOOP_INTERVAL}s...")
+        await asyncio.sleep(LOOP_INTERVAL)
 
 
 if __name__ == "__main__":
